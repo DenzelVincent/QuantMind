@@ -73,10 +73,10 @@ V2_DATASETS = [
     {"category_id": "6", "sub_category": "l1_l2_factors", "dir": "6_ml_datasets"},
 ]
 
-# 每天全量重写的分区数据集：上游每次 release 都会整段重算（如前复权/后复权
-# K 线，除权除息后历史价格全部回溯改写）。对这些数据集，本地不能只看
-# "key 已存在"就跳过，必须比对服务端 sha256 —— 变化则覆盖重下，否则会
-# 停留在上次 release 的旧复权基准（表现为"前复权只同步了一天"）。
+# 没有服务端 sha256 指纹时仍按「全量重写」处理的数据集：上游每次 release 都
+# 会整段重算（如前复权/后复权 K 线，除权除息后历史价格全部回溯改写）。
+# 注意：只要 release 对象带 sha256，所有 V2 数据集都按指纹对账（见
+# `_sync_v2_dataset`），不再依赖这份白名单；这里只作为无指纹时的兜底。
 FULL_REWRITE_V2_DATASETS = {
     "daily_forward",
     "daily_backward",
@@ -224,8 +224,29 @@ def _since_skip(key: str, since: date | None) -> bool:
     return d < since
 
 
-def _download_object(client, dataset: str, cat_id: str, key: str, target: Path, layout: str):
-    """下载单个对象，返回 (sha256, md5, size)。不校验服务端声明的 size。"""
+def _as_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _download_object(
+    client,
+    dataset: str,
+    cat_id: str,
+    key: str,
+    target: Path,
+    layout: str,
+    expected_sha: str | None = None,
+    expected_size: int | None = None,
+):
+    """下载单个对象，返回 (sha256, md5, size)。
+
+    传入 expected_sha / expected_size 时先校验再原子替换：上游重发同一 key
+    时必须确保落盘的是服务端声明的那个版本，不能把错误响应或残缺内容写成
+    正式分区。
+    """
     params = {"category_id": cat_id, "sub_category": dataset, "layout": layout}
     if layout == "v2":
         params["object_key"] = key
@@ -246,18 +267,30 @@ def _download_object(client, dataset: str, cat_id: str, key: str, target: Path, 
                     h_sha.update(chunk)
                     h_md5.update(chunk)
         size = tmp.stat().st_size
+        actual_sha = h_sha.hexdigest()
+        if expected_size is not None and size != expected_size:
+            raise RuntimeError(f"大小不符 期望{expected_size} 实际{size}")
+        if expected_sha and actual_sha.lower() != expected_sha.lower():
+            raise RuntimeError(
+                f"SHA256 不符 期望{expected_sha[:10]} 实际{actual_sha[:10]}"
+            )
         tmp.replace(target)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    return h_sha.hexdigest(), h_md5.hexdigest(), size
+    return actual_sha, h_md5.hexdigest(), size
 
 
 def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Callable | None = None, should_cancel: Callable[[], bool] | None = None, since: date | None = None) -> tuple[int, int]:
-    """同步 V2 分区数据集。跳过 patches，不校验服务端 size 声明。
+    """同步 V2 分区数据集。跳过 patches，按服务端指纹对账。
 
     先走 releases 增量，再用 manifest 补漏——服务端可能已将新数据写入 manifest
     但尚未发布 release，导致 releases-only 同步漏掉最新交易日。
+
+    跳过条件不能只看「key 已登记 + 文件存在」：上游会重算并重发同一 key
+    （如 2026-10 L2 因子补 17 列、l1_factors 补 2 列）。release 对象带
+    sha256 时，以「状态库记录的下载指纹 == 最新 release 指纹」作为唯一跳过
+    依据；不一致就重下。manifest-only 对象没有 sha256，才退回尺寸/哈希兜底。
     """
     # ---- Phase 1: releases 增量 ----
     data = client._get("/api/v1/data/releases", {"datasets": dataset, "after_release": ""})
@@ -273,6 +306,9 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
             latest[key] = obj
 
     # ---- Phase 2: manifest 补漏 ----
+    # manifest 同时是对象目录：其 size 反映服务端当前对象，可能比 release 新
+    # （上游先覆盖对象、后发 release）。这里完整保留一份用于尺寸对账。
+    manifest_by_key: dict[str, dict] = {}
     try:
         manifest = client.query_manifest(category_id=cat_id, sub_category=dataset)
         if manifest:
@@ -280,6 +316,7 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
                 key = obj.get("key", "")
                 if not key or _is_patch_key(key):
                     continue
+                manifest_by_key[key] = obj
                 if key not in latest:
                     latest[key] = obj
             if manifest and len(latest) > (sum(len(r.get("objects", [])) for r in releases) if releases else 0):
@@ -302,14 +339,59 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
         if len(latest) != raw_count:
             log.info("[V2] %s: --since=%s 过滤，保留 %d/%d 个分区对象",
                      dataset, since, len(latest), raw_count)
+    refreshed = 0
+    size_refreshed = 0
     for key, obj in latest.items():
         rel_path = obj.get("relative_path") or key
         target = QUANTDB_DATA_DIR / rel_path
-        row = state.execute("SELECT path FROM objects WHERE key=?", (key,)).fetchone()
-        if row and Path(row[0]).exists() and Path(row[0]).stat().st_size > 0:
-            # 每天全量重写的数据集（前复权等）：已登记也要比对服务端 sha，
-            # 服务端每次 release 重算都会改历史分区，sha 变了必须覆盖重下。
-            if is_full_rewrite:
+        mobj = manifest_by_key.get(key) or {}
+        expected_sha = str(obj.get("sha256") or "").strip().lower()
+        release_size = _as_int(obj.get("size"))
+        manifest_size = _as_int(mobj.get("size"))
+        if (
+            manifest_size is not None
+            and release_size is not None
+            and manifest_size != release_size
+        ):
+            # manifest 比 release 新：release 的 sha256 指向旧对象，不能用来
+            # 校验；以 manifest 的当前尺寸为准（l1_factors / daily_backward
+            # 都出现过「release 指纹==本地旧文件，但对象已被覆盖」）。
+            obj = {
+                **obj,
+                "sha256": "",
+                "size": manifest_size,
+                "etag": mobj.get("etag") or obj.get("etag", ""),
+            }
+            expected_sha = ""
+            expected_size = manifest_size
+        else:
+            expected_size = release_size if release_size is not None else manifest_size
+        row = state.execute(
+            "SELECT path, sha256, size FROM objects WHERE key=?", (key,)
+        ).fetchone()
+        local_path = Path(row[0]) if row and row[0] else None
+        if local_path and local_path.exists() and local_path.stat().st_size > 0:
+            local_size = local_path.stat().st_size
+            size_matches = expected_size is None or local_size == expected_size
+            state_sha = str(row[1] or "").strip().lower()
+            if expected_sha:
+                # 上游重算重发同一 key：指纹不一致必须重下，不能凭 key 存在跳过。
+                if size_matches and state_sha == expected_sha:
+                    continue
+                pending.append((key, obj, target))
+                refreshed += 1
+            elif size_matches and not is_full_rewrite:
+                # manifest-only 对象没有 sha256：尺寸一致视为未变化。
+                continue
+            else:
+                # 无服务端指纹：全量重写数据集或尺寸不符，用本地哈希兜底。
+                if (
+                    not size_matches
+                    and manifest_size is not None
+                    and release_size is not None
+                    and manifest_size != release_size
+                ):
+                    size_refreshed += 1
                 verify.append((key, obj, target))
             continue
         # 状态库无登记但文件已在磁盘：与云端 sha256 对上就登记跳过，
@@ -317,11 +399,19 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
         if (
             target.exists()
             and target.stat().st_size > 0
-            and str(obj.get("sha256") or "").strip()
+            and expected_sha
         ):
             verify.append((key, obj, target))
         else:
             pending.append((key, obj, target))
+
+    if refreshed or size_refreshed:
+        log.info(
+            "[V2] %s: %d 个分区 release 指纹变化、%d 个分区 manifest 尺寸变化，安排核对/重下",
+            dataset,
+            refreshed,
+            size_refreshed,
+        )
 
     if verify:
         verified_count = 0
@@ -329,8 +419,16 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
         def verify_work(item):
             key, obj, target = item
             expected = str(obj.get("sha256") or "").strip().lower()
+            expected_size = _as_int(obj.get("size"))
+            if not target.exists():
+                return key, obj, target, None
+            if expected_size is not None and target.stat().st_size != expected_size:
+                return key, obj, target, None
             actual = sha256_of(target)
-            return key, obj, target, actual if (actual and actual == expected) else None
+            if expected:
+                return key, obj, target, actual if (actual and actual == expected) else None
+            # 服务端无 sha（manifest-only）：尺寸一致即认为可用，登记本地哈希。
+            return key, obj, target, actual
 
         with ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
             for key, obj, target, actual in pool.map(verify_work, verify):
@@ -345,7 +443,7 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
                      str(target), "v2_daily_partition", dataset),
                 )
         state.commit()
-        log.info("[V2] %s: %d 个已有文件与云端哈希一致，登记跳过（免重下）",
+        log.info("[V2] %s: %d 个已有文件通过指纹/尺寸核对，登记跳过（免重下）",
                  dataset, verified_count)
 
     if not pending:
@@ -356,7 +454,17 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
 
     def work(item):
         key, obj, target = item
-        sha, _md5, size = _download_object(client, dataset, cat_id, key, target, "v2")
+        expected_size = _as_int(obj.get("size"))
+        sha, _md5, size = _download_object(
+            client,
+            dataset,
+            cat_id,
+            key,
+            target,
+            "v2",
+            expected_sha=str(obj.get("sha256") or "").strip().lower() or None,
+            expected_size=expected_size,
+        )
         return key, obj, target, sha, size
 
     with ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
@@ -378,6 +486,10 @@ def _sync_v2_dataset(client, state, cat_id: str, dataset: str, progress_cb: Call
                 log.info("[V2] %s: %d/%d", dataset, done, len(pending))
                 if progress_cb:
                     progress_cb("file", dataset=dataset, done=done, total=len(pending))
+            # 大批量补列（数千分区）时定期落状态：任务被超时/重启打断后，
+            # 已下载文件不会因状态回滚而整套重下。
+            if done % 100 == 0:
+                state.commit()
             # 协作式取消：当前文件已落盘登记，再停止后续新任务。
             if should_cancel and should_cancel():
                 pool.shutdown(wait=False, cancel_futures=True)
