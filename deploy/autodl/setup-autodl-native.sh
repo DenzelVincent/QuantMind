@@ -11,7 +11,7 @@
 # 环境变量：
 #   AUTO_DL             yes | no | skip（默认：无数据 yes；已有数据 skip）
 #   AUTODL_RESYNC       1=已有数据时仍做增量同步（ModelScope 续传，已下载文件跳过）
-#   AUTODL_DATASETS     逗号分隔，默认 l1_factors,l2_factors,l1_l2_factors
+#   AUTODL_DATASETS     逗号分隔，默认 l1_factors,l1_l2_factors
 #   AUTODL_SINCE        YYYY-MM-DD 才裁剪下载窗口；默认空=全量历史（3-year 可解析为近三年）
 #   MODELSCOPE_DATASET_REPO    魔搭数据集，默认 qusong0627/LightGBM_Alpha300
 #   MODELSCOPE_ENDPOINT        默认 https://www.modelscope.cn
